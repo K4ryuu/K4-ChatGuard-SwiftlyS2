@@ -1,6 +1,7 @@
 using K4ChatGuard.Config;
 using K4ChatGuard.Events;
 using K4ChatGuard.Services;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using SwiftlyS2.Shared;
@@ -8,10 +9,11 @@ using SwiftlyS2.Shared.Misc;
 using SwiftlyS2.Shared.NetMessages;
 using SwiftlyS2.Shared.Plugins;
 using SwiftlyS2.Shared.ProtobufDefinitions;
+using Microsoft.Extensions.Logging;
 
 namespace K4ChatGuard;
 
-[PluginMetadata(Id = "k4.chatguard", Version = "1.0.0", Name = "K4 - ChatGuard", Author = "K4ryuu", Description = "Advanced chat protection with blacklist filtering, IP blocking, and spam prevention for CS2.")]
+[PluginMetadata(Id = "k4.chatguard", Version = "1.0.2", Name = "K4 - ChatGuard", Author = "K4ryuu", Description = "Advanced chat protection with blacklist filtering, IP blocking, and spam prevention for CS2.")]
 public sealed partial class Plugin(ISwiftlyCore core) : BasePlugin(core)
 {
 	public static new ISwiftlyCore Core { get; private set; } = null!;
@@ -23,52 +25,78 @@ public sealed partial class Plugin(ISwiftlyCore core) : BasePlugin(core)
 	internal NameFilterService? NameFilterService { get; private set; }
 
 	private ChatEvents? _chatEvents;
+	private IDisposable? _configReload;
 
 	public override void Load(bool hotReload)
 	{
 		Core = base.Core;
 
-		// Initialize config
-		Core.Configuration.InitializeJsonWithModel<PluginConfig>("config.json", "K4ChatGuard");
+		const string ConfigFileName = "config.json";
+		const string ConfigSection = "K4ChatGuard";
+
+		Core.Configuration
+			.InitializeJsonWithModel<PluginConfig>(ConfigFileName, ConfigSection)
+			.Configure(cfg => cfg.AddJsonFile(
+				Core.Configuration.GetConfigPath(ConfigFileName),
+				optional: false,
+				reloadOnChange: true
+			));
 
 		ServiceCollection services = new();
 		services.AddSwiftly(Core)
-			.AddOptions<PluginConfig>()
-			.BindConfiguration("K4ChatGuard");
+			.AddOptionsWithValidateOnStart<PluginConfig>()
+			.BindConfiguration(ConfigSection);
 
 		var provider = services.BuildServiceProvider();
 		Config = provider.GetRequiredService<IOptionsMonitor<PluginConfig>>();
 
-		// Initialize services
-		BlacklistService = new BlacklistService(Core, Config.CurrentValue.BlacklistedWords);
-		IpFilterService = new IpFilterService(Core, Config.CurrentValue.WhitelistedIPs);
+		var cfg = Config.CurrentValue;
+
+		Core.Logger.LogInformation($"ChatGuard config loaded words: {string.Join(", ", cfg.BlacklistedWords)}");
+
+		BlacklistService = new BlacklistService(Core, cfg.BlacklistedWords);
+		IpFilterService = new IpFilterService(Core, cfg.WhitelistedIPs);
 		SpamService = new SpamProtectionService(
 			Core,
-			Config.CurrentValue.SpamProtection.MaxMessages,
-			Config.CurrentValue.SpamProtection.TimeWindowSeconds
+			cfg.SpamProtection.MaxMessages,
+			cfg.SpamProtection.TimeWindowSeconds
 		);
 
-		if (Config.CurrentValue.BlockBadNames)
+		if (cfg.BlockBadNames)
 		{
 			NameFilterService = new NameFilterService(
 				Core,
 				BlacklistService,
-				Config.CurrentValue.BlockedNameReplacement
+				cfg.BlockedNameReplacement
 			);
 		}
 
-		// Register events
+		_configReload = Config.OnChange(newCfg =>
+		{
+			Core.Logger.LogInformation($"ChatGuard config reloaded words: {string.Join(", ", newCfg.BlacklistedWords)}");
+
+			BlacklistService.UpdateWords(newCfg.BlacklistedWords);
+			IpFilterService.UpdateWhitelist(newCfg.WhitelistedIPs);
+			SpamService.UpdateSettings(
+				newCfg.SpamProtection.MaxMessages,
+				newCfg.SpamProtection.TimeWindowSeconds
+			);
+
+			NameFilterService?.UpdateReplacement(newCfg.BlockedNameReplacement);
+		});
+
 		_chatEvents = new ChatEvents(Core, Config, BlacklistService, IpFilterService, SpamService, NameFilterService);
 	}
 
 	public override void Unload()
 	{
-		// Cleanup if needed
+		_configReload?.Dispose();
+		_configReload = null;
 	}
 
 	[ServerNetMessageHandler]
 	public HookResult OnChatMessage(CUserMessageSayText2 msg)
 	{
-		return _chatEvents!.HandleChatMessage(msg);
+		return _chatEvents?.HandleChatMessage(msg) ?? HookResult.Continue;
 	}
 }

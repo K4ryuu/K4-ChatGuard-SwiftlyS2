@@ -6,73 +6,63 @@ namespace K4ChatGuard.Services;
 
 public class SpamProtectionService
 {
-	private readonly ISwiftlyCore _core;
-	private readonly ConcurrentDictionary<ulong, Queue<DateTime>> _playerData = new();
-	private readonly ConcurrentDictionary<ulong, DateTime> _lastSpamAttempt = new();
-	private readonly int _maxMessages;
-	private readonly int _timeWindowSeconds;
+	private sealed class SpamState
+	{
+		public readonly object Lock = new();
+		public readonly Queue<long> Messages = new();
+		public long CooldownUntilTicks;
+	}
 
-	public SpamProtectionService(
-		ISwiftlyCore core,
-		int maxMessages,
-		int timeWindowSeconds)
+	private readonly ISwiftlyCore _core;
+	private readonly ConcurrentDictionary<ulong, SpamState> _playerData = new();
+
+	private volatile int _maxMessages;
+	private volatile int _timeWindowSeconds;
+
+	public SpamProtectionService(ISwiftlyCore core, int maxMessages, int timeWindowSeconds)
 	{
 		_core = core;
-		_maxMessages = maxMessages;
-		_timeWindowSeconds = timeWindowSeconds;
+		UpdateSettings(maxMessages, timeWindowSeconds);
+	}
 
-		_core.Logger.LogInformation(
-			$"Spam Protection: {maxMessages} messages per {timeWindowSeconds}s"
-		);
+	public void UpdateSettings(int maxMessages, int timeWindowSeconds)
+	{
+		_maxMessages = Math.Max(1, maxMessages);
+		_timeWindowSeconds = Math.Max(1, timeWindowSeconds);
+
+		_core.Logger.LogInformation($"Spam Protection: {_maxMessages} messages per {_timeWindowSeconds}s");
 	}
 
 	public bool IsChatSpam(ulong steamId)
 	{
-		var data = _playerData.GetOrAdd(steamId, _ => new Queue<DateTime>());
-		var now = DateTime.UtcNow;
+		var state = _playerData.GetOrAdd(steamId, _ => new SpamState());
 
-		// Check if player is in cooldown from previous spam
-		if (_lastSpamAttempt.TryGetValue(steamId, out var lastSpam))
+		var nowTicks = DateTime.UtcNow.Ticks;
+		var windowTicks = TimeSpan.FromSeconds(_timeWindowSeconds).Ticks;
+		var windowStartTicks = nowTicks - windowTicks;
+
+		lock (state.Lock)
 		{
-			var cooldownEnd = lastSpam.AddSeconds(_timeWindowSeconds);
-			if (now < cooldownEnd)
+			if (state.CooldownUntilTicks > nowTicks)
+				return true;
+
+			while (state.Messages.Count > 0 && state.Messages.Peek() < windowStartTicks)
+				state.Messages.Dequeue();
+
+			if (state.Messages.Count >= _maxMessages)
 			{
-				// Still in cooldown, update last spam attempt to extend cooldown
-				_lastSpamAttempt[steamId] = now;
+				state.Messages.Clear();
+				state.CooldownUntilTicks = nowTicks + windowTicks;
 				return true;
 			}
-			else
-			{
-				// Cooldown expired, clear spam data
-				_lastSpamAttempt.TryRemove(steamId, out _);
-				data.Clear();
-			}
+
+			state.Messages.Enqueue(nowTicks);
+			return false;
 		}
-
-		var windowStart = now.AddSeconds(-_timeWindowSeconds);
-
-		// Remove old messages outside the time window
-		while (data.Count > 0 && data.Peek() < windowStart)
-		{
-			data.Dequeue();
-		}
-
-		// Check if spam limit exceeded
-		if (data.Count >= _maxMessages)
-		{
-			// Mark as spam and start cooldown
-			_lastSpamAttempt[steamId] = now;
-			return true;
-		}
-
-		// Add current message
-		data.Enqueue(now);
-		return false;
 	}
 
 	public void ClearPlayerData(ulong steamId)
 	{
 		_playerData.TryRemove(steamId, out _);
-		_lastSpamAttempt.TryRemove(steamId, out _);
 	}
 }

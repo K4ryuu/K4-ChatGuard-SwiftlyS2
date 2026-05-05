@@ -7,6 +7,7 @@ using SwiftlyS2.Shared.Commands;
 using SwiftlyS2.Shared.Events;
 using SwiftlyS2.Shared.GameEventDefinitions;
 using SwiftlyS2.Shared.Misc;
+using SwiftlyS2.Shared.Players;
 using SwiftlyS2.Shared.ProtobufDefinitions;
 
 namespace K4ChatGuard.Events;
@@ -51,23 +52,91 @@ public class ChatEvents
 		if (player == null || player.IsFakeClient)
 			return HookResult.Continue;
 
-		// Permission bypass check
-		bool bypassAll = _core.Permission.PlayerHasPermission(player.SteamID, "chatguard.bypass.all");
-		bool bypassSpam = bypassAll || _core.Permission.PlayerHasPermission(player.SteamID, "chatguard.bypass.spam");
+		var cfg = _config.CurrentValue;
 
-		// Check spam protection (event-based)
-		if (!bypassSpam && _config.CurrentValue.SpamProtection.Enabled && _spamService.IsChatSpam(player.SteamID))
+		var bypassAll = _core.Permission.PlayerHasPermission(player.SteamID, "chatguard.bypass.all");
+
+		if (!bypassAll && cfg.SpamProtection.Enabled)
 		{
-			var localizer = _core.Translation.GetPlayerLocalizer(player);
-			var prefix = localizer["prefix"];
-			var message = localizer["spam.chat.warning", prefix];
-			player.SendChat(message);
+			var bypassSpam = _core.Permission.PlayerHasPermission(player.SteamID, "chatguard.bypass.spam");
 
-			_core.Logger.LogInformation($"Chat spam detected from {player.Controller.PlayerName} ({player.SteamID})");
-			return HookResult.Stop;
+			if (!bypassSpam && _spamService.IsChatSpam(player.SteamID))
+			{
+				SendLocalized(player, "spam.chat.warning");
+				_core.Logger.LogInformation($"Chat spam detected from {player.Controller.PlayerName} ({player.SteamID})");
+				return HookResult.Stop;
+			}
 		}
 
+		if (ShouldBlockText(player, text))
+			return HookResult.Stop;
+
+		if (cfg.BlockBadNames && _nameFilterService != null)
+			_nameFilterService.CheckAndRenameBadName(player);
+
 		return HookResult.Continue;
+	}
+
+	public HookResult HandleChatMessage(CUserMessageSayText2 msg)
+	{
+		if (msg.Entityindex <= 0)
+			return HookResult.Continue;
+
+		var player = _core.PlayerManager.GetPlayer(msg.Entityindex)
+			?? _core.PlayerManager.GetPlayer(msg.Entityindex - 1);
+
+		if (player == null || player.IsFakeClient)
+			return HookResult.Continue;
+
+		var text = msg.Param2;
+
+		return ShouldBlockText(player, text)
+			? HookResult.Stop
+			: HookResult.Continue;
+	}
+
+	private bool ShouldBlockText(IPlayer player, string? text)
+	{
+		if (string.IsNullOrWhiteSpace(text))
+			return false;
+
+		var cfg = _config.CurrentValue;
+		var steamId = player.SteamID;
+
+		var bypassAll = _core.Permission.PlayerHasPermission(steamId, "chatguard.bypass.all");
+
+		if (!bypassAll)
+		{
+			var bypassBlacklist = _core.Permission.PlayerHasPermission(steamId, "chatguard.bypass.blacklist");
+
+			if (!bypassBlacklist && _blacklistService.ContainsBlacklistedWord(text, out var matchedWord))
+			{
+				SendLocalized(player, "blacklist.blocked");
+				_core.Logger.LogInformation($"Blocked blacklisted word '{matchedWord}' from {player.Controller.PlayerName} ({steamId})");
+				return true;
+			}
+		}
+
+		if (!bypassAll && cfg.BlockIpAddresses)
+		{
+			var bypassIpFilter = _core.Permission.PlayerHasPermission(steamId, "chatguard.bypass.ipfilter");
+
+			if (!bypassIpFilter && _ipFilterService.ContainsIpAddress(text, out var detectedIp))
+			{
+				SendLocalized(player, "ipfilter.blocked");
+				_core.Logger.LogInformation($"Blocked IP address '{detectedIp}' from {player.Controller.PlayerName} ({steamId})");
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private void SendLocalized(IPlayer player, string key)
+	{
+		var localizer = _core.Translation.GetPlayerLocalizer(player);
+		var prefix = localizer["prefix"];
+		player.SendChat(localizer[key, prefix]);
 	}
 
 	public HookResult OnClientActivated(EventPlayerActivate @event)
@@ -96,54 +165,10 @@ public class ChatEvents
 	public HookResult OnPlayerChangeName(EventPlayerChangename e)
 	{
 		var player = e.UserIdPlayer;
-		if (player == null)
+		if (player == null || _nameFilterService == null)
 			return HookResult.Continue;
 
-		_nameFilterService!.CheckAndRenameBadName(player);
-		return HookResult.Continue;
-	}
-
-	public HookResult HandleChatMessage(CUserMessageSayText2 msg)
-	{
-		if (msg.Entityindex <= 0)
-			return HookResult.Continue;
-
-		var player = _core.PlayerManager.GetPlayer(msg.Entityindex - 1);
-		if (player == null || player.IsFakeClient)
-			return HookResult.Continue;
-
-		var text = msg.Param2;
-
-		// Permission bypass checks
-		bool bypassAll = _core.Permission.PlayerHasPermission(player.SteamID, "chatguard.bypass.all");
-		bool bypassBlacklist = bypassAll || _core.Permission.PlayerHasPermission(player.SteamID, "chatguard.bypass.blacklist");
-		bool bypassIpFilter = bypassAll || _core.Permission.PlayerHasPermission(player.SteamID, "chatguard.bypass.ipfilter");
-
-		var localizer = _core.Translation.GetPlayerLocalizer(player);
-		var prefix = localizer["prefix"];
-
-		// Check blacklisted words (protobuf-based filter)
-		if (!bypassBlacklist && _blacklistService.ContainsBlacklistedWord(text, out var matchedWord))
-		{
-			var message = localizer["blacklist.blocked", prefix];
-			player.SendChat(message);
-
-			// Censor the word in logs
-			_core.Logger.LogInformation($"Blocked blacklisted word '{matchedWord}' from {player.Controller.PlayerName} ({player.SteamID})");
-			return HookResult.Stop;
-		}
-
-		// Check IP addresses (protobuf-based filter)
-		if (!bypassIpFilter && _config.CurrentValue.BlockIpAddresses && _ipFilterService.ContainsIpAddress(text, out var detectedIp))
-		{
-			var message = localizer["ipfilter.blocked", prefix];
-			player.SendChat(message);
-
-			// Censor the IP in logs
-			_core.Logger.LogInformation($"Blocked IP address '{detectedIp}' from {player.Controller.PlayerName} ({player.SteamID})");
-			return HookResult.Stop;
-		}
-
+		_nameFilterService.CheckAndRenameBadName(player);
 		return HookResult.Continue;
 	}
 }
